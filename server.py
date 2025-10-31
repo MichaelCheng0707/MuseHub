@@ -12,12 +12,15 @@ import os
 # accessible as a variable in index.html:
 from sqlalchemy import *
 from sqlalchemy.pool import NullPool
-from flask import Flask, request, render_template, g, redirect, Response, abort
+from flask import Flask, request, render_template, g, redirect, Response, abort, jsonify, session, flash, url_for
+from werkzeug.security import generate_password_hash, check_password_hash
+from datetime import datetime
+import uuid
 from dotenv import load_dotenv; load_dotenv()
 
 tmpl_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'templates')
 app = Flask(__name__, template_folder=tmpl_dir)
-
+app.secret_key = os.urandom(24)
 
 #
 # The following is a dummy URI that does not connect to a valid database. You will need to modify it to connect to your Part 2 database in order to use the data.
@@ -42,6 +45,20 @@ DATABASEURI = f"postgresql://{DATABASE_USERNAME}:{DATABASE_PASSWRD}@{DATABASE_HO
 #
 engine = create_engine(DATABASEURI)
 
+def create_users_table():
+    with engine.begin() as conn:
+        create_table_command = """
+        CREATE TABLE IF NOT EXISTS tc3497.users (
+            user_id uuid PRIMARY KEY,
+            email text UNIQUE NOT NULL,
+            username text,
+            password text NOT NULL,
+            join_date timestamptz NOT NULL DEFAULT now()
+        )
+        """
+        conn.execute(text(create_table_command))
+
+create_users_table()
 #
 # Example of running queries in your database
 # Note that this will probably not work if you already have a table named 'test' in your database, containing meaningful data. This is only an example showing you how to run queries in your database using SQLAlchemy.
@@ -59,16 +76,8 @@ with engine.connect() as conn:
 	# you need to commit for create, insert, update queries to reflect
 	conn.commit()
 
-
 @app.before_request
 def before_request():
-	"""
-	This function is run at the beginning of every web request 
-	(every time you enter an address in the web browser).
-	We use it to setup a database connection that can be used throughout the request.
-
-	The variable g is globally accessible.
-	"""
 	try:
 		g.conn = engine.connect()
 	except:
@@ -162,19 +171,6 @@ def index():
 	#
 	return render_template("index.html", **context)
 
-#
-# This is an example of a different path.  You can see it at:
-# 
-#     localhost:8111/another
-#
-# Notice that the function name is another() rather than index()
-# The functions for each app.route need to have different names
-#
-@app.route('/another')
-def another():
-	return render_template("another.html")
-
-
 # Example of adding new data to the database
 @app.route('/add', methods=['POST'])
 def add():
@@ -189,12 +185,91 @@ def add():
 	return redirect('/')
 
 
-@app.route('/login')
+@app.route('/login', methods=['GET', 'POST'])
 def login():
-	abort(401)
-	# Your IDE may highlight this as a problem - because no such function exists (intentionally).
-	# This code is never executed because of abort().
-	this_is_never_executed()
+    if request.method == 'POST':
+        email = request.form['email']
+        password = request.form['password']
+        
+        cursor = g.conn.execute(text("SELECT * FROM tc3497.users WHERE email = :email"), {'email': email})
+        user_row = cursor.fetchone()
+        cursor.close()
+
+        if user_row:
+            user = dict(zip(cursor.keys(), user_row))
+            if check_password_hash(user['password'], password):
+                session['user_id'] = user['user_id']
+                session['email'] = user['email']
+                return redirect(url_for('songs_page'))
+
+        flash('Invalid email or password')
+        return redirect(url_for('login'))
+
+    return render_template('login.html')
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        email = request.form['email']
+        password = request.form['password']
+        username = request.form.get('username')
+
+        cursor = g.conn.execute(text("SELECT * FROM tc3497.users WHERE email = :email"), {'email': email})
+        existing_user = cursor.fetchone()
+        cursor.close()
+
+        if existing_user:
+            flash('Email already registered')
+            return redirect(url_for('register'))
+
+        user_id = str(uuid.uuid4())
+        if not username:
+            username = user_id
+
+        hashed_password = generate_password_hash(password, method='pbkdf2:sha256')
+        
+        params = {
+            'user_id': user_id,
+            'email': email,
+            'username': username,
+            'password': hashed_password,
+            'join_date': datetime.utcnow()
+        }
+        g.conn.execute(text('INSERT INTO tc3497.users(user_id, email, username, password, join_date) VALUES (:user_id, :email, :username, :password, :join_date)'), params)
+        g.conn.commit()
+
+        flash('Account created successfully, please login.')
+        return redirect(url_for('login'))
+
+    return render_template('register.html')
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
+
+# === 新增：HTML 頁面，直接把 songs 串到模板 ===
+@app.route('/songs')
+def songs_page():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    # 先抓一些資料（避免一次出太多，先給 200 筆）
+    stmt = text("SELECT * FROM tc3497.songs LIMIT 200")
+    cursor = g.conn.execute(stmt)
+    cols = cursor.keys()                    # 動態取得欄位名稱，不假設 schema
+    rows = [dict(zip(cols, row)) for row in cursor]
+    cursor.close()
+    return render_template("songs.html", cols=cols, rows=rows)
+
+# === 新增：API 端點，回傳 JSON，之後要做前端 fetch 也方便 ===
+@app.route('/api/songs')
+def api_songs():
+    stmt = text("SELECT * FROM tc3497.songs LIMIT 200")
+    cursor = g.conn.execute(stmt)
+    cols = cursor.keys()
+    data = [dict(zip(cols, row)) for row in cursor]
+    cursor.close()
+    return jsonify(data)
 
 
 if __name__ == "__main__":
@@ -220,6 +295,7 @@ if __name__ == "__main__":
 
 		HOST, PORT = host, port
 		print("running on %s:%d" % (HOST, PORT))
-		app.run(host=HOST, port=PORT, debug=debug, threaded=threaded)
+		app.run(host=HOST, port=PORT, debug=True, threaded=threaded)
 
 run()
+

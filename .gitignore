@@ -18,3 +18,9 @@ __pycache__/
 
 # Secrets
 .env
+
+# YoYo AI version control directory
+.yoyo/
+
+# Images
+*.png
